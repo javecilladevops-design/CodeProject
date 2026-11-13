@@ -11,8 +11,8 @@
 #   ansible-playbook -i inventario limpieza_sudo_io.yml -e "target_hosts=mis_servidores" -e "dry_run=true"
 
 - name: Limpieza de sesiones sudo-io antiguas si el filesystem supera el umbral
-  hosts: "{{ target_hosts | default('all') }}"
-  #become: true
+  hosts: all
+  become: true
   gather_facts: false
 
   vars:
