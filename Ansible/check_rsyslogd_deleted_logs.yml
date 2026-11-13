@@ -1,0 +1,94 @@
+---
+# Playbook: check_rsyslogd_deleted_logs.yml
+#
+# Objetivo:
+#   Detectar archivos de log en estado "(deleted)" que el proceso
+#   rsyslogd mantiene abiertos. Esto suele ocurrir cuando un log
+#   es rotado (logrotate, etc.) sin enviar el HUP/reload correspondiente
+#   a rsyslogd, provocando que el espacio en disco no se libere aunque
+#   el archivo ya no aparezca en el sistema de ficheros.
+#
+# Uso:
+#   ansible-playbook -i inventario.ini check_rsyslogd_deleted_logs.yml
+#
+#   Para desactivar el reload automático de rsyslog (solo auditar, sin remediar):
+#   ansible-playbook -i inventario.ini check_rsyslogd_deleted_logs.yml \
+#     -e "remediate_rsyslogd_deleted=false"
+#
+# Requiere:
+#   - Acceso a /proc/<pid>/fd del host (normalmente root, por eso become: true)
+#   - Que el servicio se llame 'rsyslog' en systemd (ajustar 'name' si difiere,
+#     p. ej. 'rsyslogd' en algunas distros)
+
+- name: Verificar logs en estado 'deleted' asociados a rsyslogd
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Obtener PID(s) de rsyslogd
+      ansible.builtin.command: pgrep -x rsyslogd
+      register: rsyslogd_pids
+      changed_when: false
+      failed_when: false
+
+    - name: Informar si rsyslogd no está en ejecución en este host
+      ansible.builtin.debug:
+        msg: "rsyslogd no está en ejecución en este host."
+      when: rsyslogd_pids.stdout == ""
+
+    - name: Buscar file descriptors marcados como '(deleted)' por cada PID de rsyslogd
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -l /proc/{{ item }}/fd 2>/dev/null | grep '(deleted)' || true
+      args:
+        executable: /bin/bash
+      register: deleted_fds
+      changed_when: false
+      loop: "{{ rsyslogd_pids.stdout_lines }}"
+      loop_control:
+        label: "PID {{ item }}"
+      when: rsyslogd_pids.stdout != ""
+
+    - name: Consolidar hallazgos en una única lista
+      ansible.builtin.set_fact:
+        rsyslogd_deleted_logs: "{{ deleted_fds.results | map(attribute='stdout_lines') | flatten }}"
+      when: rsyslogd_pids.stdout != ""
+
+    - name: Mostrar detalle por PID
+      ansible.builtin.debug:
+        msg: >-
+          PID {{ item.item }}:
+          {{ item.stdout_lines if item.stdout_lines | length > 0 else ['Sin descriptores en estado deleted'] }}
+      loop: "{{ deleted_fds.results }}"
+      loop_control:
+        label: "PID {{ item.item }}"
+      when: rsyslogd_pids.stdout != ""
+
+    - name: Alertar si existen logs 'deleted' aún abiertos por rsyslogd
+      ansible.builtin.debug:
+        msg: >-
+          ATENCIÓN: rsyslogd mantiene {{ rsyslogd_deleted_logs | length }}
+          descriptor(es) apuntando a archivos eliminados.
+          Esto suele indicar una rotación de logs sin el HUP/reload
+          correspondiente a rsyslogd, lo que impide liberar el espacio
+          en disco.
+      when:
+        - rsyslogd_pids.stdout != ""
+        - rsyslogd_deleted_logs | length > 0
+
+    - name: Enviar HUP a rsyslog para que libere los descriptores 'deleted'
+      ansible.builtin.command: systemctl kill -s HUP rsyslog
+      changed_when: true
+      when:
+        - rsyslogd_pids.stdout != ""
+        - rsyslogd_deleted_logs | length > 0
+        - remediate_rsyslogd_deleted | default(true) | bool
+
+    - name: Confirmar que no hay hallazgos
+      ansible.builtin.debug:
+        msg: "OK: no se encontraron archivos 'deleted' abiertos por rsyslogd."
+      when:
+        - rsyslogd_pids.stdout != ""
+        - rsyslogd_deleted_logs | length == 0
