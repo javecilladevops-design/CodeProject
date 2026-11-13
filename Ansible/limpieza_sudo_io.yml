@@ -1,0 +1,109 @@
+---
+# Playbook: limpieza de /var/log/sudo-io
+# Si el filesystem donde reside /var/log/sudo-io está al 75% (o más) de uso,
+# borra el contenido con más de 6 meses de antigüedad.
+#
+# Uso:
+#   ansible-playbook -i inventario limpieza_sudo_io.yml -e "target_hosts=mis_servidores"
+#   Simulación (no borra nada):
+#   ansible-playbook -i inventario limpieza_sudo_io.yml -e "target_hosts=mis_servidores" -e "dry_run=true"
+
+- name: Limpieza de sesiones sudo-io antiguas si el filesystem supera el umbral
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    sudo_io_path: /var/log/sudo-io
+    usage_threshold: 75          # % de uso a partir del cual se limpia
+    retention_period: "6 months ago"
+    dry_run: false
+
+  tasks:
+    - name: Comprobar que el directorio existe
+      ansible.builtin.stat:
+        path: "{{ sudo_io_path }}"
+      register: sudo_io_dir
+
+    - name: Abortar en este host si el directorio no existe
+      ansible.builtin.meta: end_host
+      when: not (sudo_io_dir.stat.exists and sudo_io_dir.stat.isdir)
+
+    - name: Obtener el % de uso del filesystem que contiene el directorio
+      ansible.builtin.shell: |
+        set -o pipefail
+        df --output=pcent "{{ sudo_io_path }}" | tail -n 1 | tr -dc '0-9'
+      args:
+        executable: /bin/bash
+      register: fs_usage
+      changed_when: false
+      check_mode: false
+
+    - name: Obtener el punto de montaje (informativo)
+      ansible.builtin.command: findmnt -no TARGET --target "{{ sudo_io_path }}"
+      register: fs_mount
+      changed_when: false
+      check_mode: false
+
+    - name: Mostrar uso actual
+      ansible.builtin.debug:
+        msg: >-
+          {{ sudo_io_path }} está en el filesystem montado en {{ fs_mount.stdout }}
+          con un uso del {{ fs_usage.stdout }}% (umbral: {{ usage_threshold }}%).
+
+    - name: Limpieza de ficheros antiguos
+      when: (fs_usage.stdout | int) >= usage_threshold
+      block:
+        - name: Listar ficheros con más de 6 meses (se excluye el fichero 'seq' de sudo)
+          ansible.builtin.command: >-
+            find {{ sudo_io_path }} -type f ! -name seq
+            ! -newermt "{{ retention_period }}"
+          register: old_files
+          changed_when: false
+          check_mode: false
+
+        - name: Mostrar cantidad de ficheros a borrar
+          ansible.builtin.debug:
+            msg: "{{ old_files.stdout_lines | length }} ficheros con más de 6 meses."
+
+        - name: Borrar ficheros antiguos
+          ansible.builtin.command: >-
+            find {{ sudo_io_path }} -type f ! -name seq
+            ! -newermt "{{ retention_period }}" -delete
+          when:
+            - not dry_run | bool
+            - old_files.stdout_lines | length > 0
+          changed_when: true
+
+        - name: Borrar directorios de sesión que hayan quedado vacíos
+          ansible.builtin.command: >-
+            find {{ sudo_io_path }} -mindepth 1 -type d -empty -delete
+          when:
+            - not dry_run | bool
+            - old_files.stdout_lines | length > 0
+          changed_when: true
+
+        - name: Comprobar el uso del filesystem tras la limpieza
+          ansible.builtin.shell: |
+            set -o pipefail
+            df --output=pcent "{{ sudo_io_path }}" | tail -n 1 | tr -dc '0-9'
+          args:
+            executable: /bin/bash
+          register: fs_usage_after
+          changed_when: false
+          check_mode: false
+
+        - name: Resultado
+          ansible.builtin.debug:
+            msg: >-
+              {{ 'SIMULACIÓN: ' if dry_run | bool else '' }}uso antes: {{ fs_usage.stdout }}% ->
+              uso después: {{ fs_usage_after.stdout }}%
+
+        - name: Avisar si sigue por encima del umbral
+          ansible.builtin.debug:
+            msg: >-
+              AVISO: el filesystem sigue al {{ fs_usage_after.stdout }}%.
+              Los ficheros recientes (< 6 meses) no se han tocado; revisa si hay que ampliar el volumen.
+          when:
+            - not dry_run | bool
+            - (fs_usage_after.stdout | int) >= usage_threshold
