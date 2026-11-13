@@ -12,7 +12,7 @@
 
 - name: Limpieza de sesiones sudo-io antiguas si el filesystem supera el umbral
   hosts: "{{ target_hosts | default('all') }}"
-  become: true
+  #become: true
   gather_facts: false
 
   vars:
