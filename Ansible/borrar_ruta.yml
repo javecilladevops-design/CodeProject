@@ -1,0 +1,132 @@
+---
+# Requiere la colección ansible.posix:  ansible-galaxy collection install ansible.posix
+# Requiere el paquete psmisc (comando fuser) en los hosts destino.
+- name: Borrar una carpeta o desmontar un filesystem
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    #ruta_a_borrar: /tmp/mi_carpeta   # Cambia esta ruta o pásala con -e ruta_a_borrar=/ruta
+
+  tasks:
+    - name: Comprobar qué es la ruta
+      ansible.builtin.stat:
+        path: "{{ ruta_a_borrar }}"
+        follow: false
+      register: info_ruta
+
+    - name: Comprobar si la ruta es un punto de montaje
+      ansible.builtin.command: mountpoint -q "{{ ruta_a_borrar }}"
+      register: es_fs
+      changed_when: false
+      failed_when: false
+      when: info_ruta.stat.exists
+
+    # ---- Recoger información ANTES de borrar o desmontar ----
+    - name: Guardar datos del FS montado (dispositivo, tipo, opciones)
+      ansible.builtin.command: findmnt -n -o SOURCE,FSTYPE,OPTIONS -M "{{ ruta_a_borrar }}"
+      register: info_fs
+      changed_when: false
+      failed_when: false
+      when:
+        - info_ruta.stat.exists
+        - es_fs.rc == 0
+
+    - name: Guardar la línea de /etc/fstab de este punto de montaje
+      ansible.builtin.command: awk '$1 !~ /^#/ && $2 == "{{ ruta_a_borrar }}"' /etc/fstab
+      register: fstab_antes
+      changed_when: false
+      failed_when: false
+      when:
+        - info_ruta.stat.exists
+        - es_fs.rc == 0
+
+    - name: Guardar tamaño y nº de elementos de la carpeta
+      ansible.builtin.shell: >-
+        echo "$(du -sh {{ ruta_a_borrar | quote }} | cut -f1) en
+        $(find {{ ruta_a_borrar | quote }} | wc -l) elementos (incluida la propia carpeta)"
+      register: info_carpeta
+      changed_when: false
+      failed_when: false
+      when:
+        - info_ruta.stat.exists
+        - info_ruta.stat.isdir
+        - es_fs.rc != 0
+
+    # ---- Caso 2: es un FS -> desmontar y quitar de /etc/fstab ----
+    - name: Desmontar el FS y quitarlo del fstab
+      when:
+        - info_ruta.stat.exists
+        - es_fs.rc == 0
+      block:
+        - name: Desmontar y eliminar la entrada de fstab
+          ansible.posix.mount:
+            path: "{{ ruta_a_borrar }}"
+            state: absent
+      rescue:
+        - name: El FS está en uso -> liberar (matar procesos que lo usan)
+          ansible.builtin.command: fuser -km "{{ ruta_a_borrar }}"
+          register: liberar
+          changed_when: liberar.rc == 0
+          failed_when: false
+
+        - name: Esperar a que los procesos terminen
+          ansible.builtin.pause:
+            seconds: 3
+
+        - name: Reintentar desmontar y eliminar la entrada de fstab
+          ansible.posix.mount:
+            path: "{{ ruta_a_borrar }}"
+            state: absent
+
+    # ---- Caso 1: es una carpeta (y no es un punto de montaje) -> borrarla ----
+    - name: Borrar la ruta si es una carpeta (de forma recursiva)
+      ansible.builtin.file:
+        path: "{{ ruta_a_borrar }}"
+        state: absent
+      when:
+        - info_ruta.stat.exists
+        - info_ruta.stat.isdir
+        - es_fs.rc != 0
+
+    # ---- Resumen final ----
+    - name: "Resumen: la ruta no existe"
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "La ruta {{ ruta_a_borrar }} no existe. No se ha hecho nada."
+      when: not info_ruta.stat.exists
+
+    - name: "Resumen: FS desmontado"
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "FS DESMONTADO: {{ ruta_a_borrar }}"
+          - "Origen / tipo / opciones: {{ info_fs.stdout | default('sin datos') }}"
+          - "Entrada eliminada de /etc/fstab: {{ fstab_antes.stdout if fstab_antes.stdout | default('') else 'no había entrada en fstab' }}"
+          - "Estaba en uso: {{ 'SÍ, se liberó matando los procesos que lo usaban (fuser -km)' if liberar is defined and liberar is not skipped else 'no' }}"
+      when:
+        - info_ruta.stat.exists
+        - es_fs.rc == 0
+
+    - name: "Resumen: carpeta borrada"
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "CARPETA BORRADA: {{ ruta_a_borrar }}"
+          - "Contenido eliminado: {{ info_carpeta.stdout | default('sin datos') }}"
+      when:
+        - info_ruta.stat.exists
+        - info_ruta.stat.isdir
+        - es_fs.rc != 0
+
+    - name: "Resumen: la ruta existe pero no es carpeta ni FS"
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "{{ ruta_a_borrar }} no es una carpeta ni un FS montado. No se ha tocado."
+      when:
+        - info_ruta.stat.exists
+        - not info_ruta.stat.isdir
+        - es_fs.rc != 0
