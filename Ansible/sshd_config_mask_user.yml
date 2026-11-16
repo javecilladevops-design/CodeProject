@@ -68,3 +68,10 @@
         name: "{{ sshd_service }}"
         state: reloaded
       when: match_user_result is changed
+    
+    - name: Mostrar resultado
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'El usuario ' ~ usuario ~ ' SE HA AGREGADO a Match User en ' ~ inventory_hostname ~ ' y sshd se ha recargado.'
+             if match_user_result is changed
+             else 'El usuario ' ~ usuario ~ ' NO se ha agregado en ' ~ inventory_hostname ~ ' (ya estaba en Match User o no hay línea que modificar).' }}
