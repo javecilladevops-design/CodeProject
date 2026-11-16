@@ -1,0 +1,70 @@
+---
+# Uso:
+#   ansible-playbook -i inventario sshd_config_mutable.yml -e usuario=nuevo_usuario
+#
+# Variables opcionales:
+#   sshd_service  (por defecto: sshd; en Debian/Ubuntu usar: ssh)
+#   sshd_bin      (por defecto: /usr/sbin/sshd)
+
+- name: Añadir usuario a Match User en sshd_config
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    sshd_config_path: /etc/ssh/sshd_config
+    sshd_service: sshd
+    sshd_bin: /usr/sbin/sshd
+
+  tasks:
+    - name: Comprobar que se ha pasado el parámetro usuario
+      ansible.builtin.assert:
+        that:
+          - usuario is defined
+          - usuario | length > 0
+          - usuario is match('^[a-zA-Z0-9._-]+$')
+        fail_msg: "Debes pasar un usuario válido: -e usuario=nombre"
+      run_once: true
+
+    - name: Comprobar que sshd_config existe
+      ansible.builtin.stat:
+        path: "{{ sshd_config_path }}"
+      register: sshd_config_stat
+
+    - name: Fallar si el fichero no existe
+      ansible.builtin.fail:
+        msg: "{{ sshd_config_path }} no existe en {{ inventory_hostname }}"
+      when: not sshd_config_stat.stat.exists
+
+    - name: Modificar sshd_config y dejarlo siempre inmutable al terminar
+      block:
+        - name: Quitar el atributo inmutable (chattr -i)
+          ansible.builtin.file:
+            path: "{{ sshd_config_path }}"
+            attributes: "-i"
+
+        - name: Añadir el usuario a la línea Match User (si no está ya)
+          ansible.builtin.lineinfile:
+            path: "{{ sshd_config_path }}"
+            regexp: '^(Match User\s+(?!(?:\S*,)?{{ usuario | regex_escape }}(?:,|$))\S+)$'
+            line: '\1,{{ usuario }}'
+            backrefs: true
+            backup: true
+            validate: "{{ sshd_bin }} -t -f %s"
+          register: match_user_result
+
+        - name: Verificar la sintaxis de sshd_config
+          ansible.builtin.command: "{{ sshd_bin }} -t -f {{ sshd_config_path }}"
+          changed_when: false
+
+      always:
+        - name: Volver a hacer inmutable el fichero (chattr +i)
+          ansible.builtin.file:
+            path: "{{ sshd_config_path }}"
+            attributes: "+i"
+
+    - name: Recargar el servicio sshd
+      ansible.builtin.systemd:
+        name: "{{ sshd_service }}"
+        state: reloaded
+      when: match_user_result is changed
