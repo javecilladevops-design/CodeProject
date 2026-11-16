@@ -1,0 +1,97 @@
+---
+# Descarga (sin instalar) los parches pendientes en servidores RHEL 8/9.
+# Los paquetes quedan en caché local de cada servidor para instalarlos después
+# en la ventana de mantenimiento.
+#
+# Uso:
+#   ansible-playbook -i inventario descargar_parches_rhel.yml
+#   ansible-playbook -i inventario descargar_parches_rhel.yml -e solo_seguridad=true
+#   ansible-playbook -i inventario descargar_parches_rhel.yml -e grupo=produccion
+
+- name: Descargar parches localmente en servidores RHEL
+  hosts: "{{ grupo | default('all') }}"
+  become: true
+  gather_facts: true
+  strategy: free
+
+  vars:
+    # true = solo errata de seguridad; false = todas las actualizaciones
+    solo_seguridad: false
+    # Directorio de descarga (requiere ansible-core >= 2.12)
+    directorio_descarga: /var/cache/dnf-parches
+    # Espacio libre mínimo (MB) en el filesystem de descarga
+    espacio_minimo_mb: 2048
+    # Reintentos si el repo/Satellite no responde
+    reintentos: 3
+
+  pre_tasks:
+    - name: Verificar que es una distribución RedHat
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'RedHat'
+          - ansible_facts['distribution_major_version'] | int >= 8
+        fail_msg: "Este playbook está pensado para RHEL 8 o superior (usa dnf)."
+
+    - name: Crear directorio de descarga
+      ansible.builtin.file:
+        path: "{{ directorio_descarga }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Comprobar espacio libre en el filesystem de descarga
+      ansible.builtin.set_fact:
+        espacio_libre_mb: >-
+          {{ (ansible_facts['mounts']
+              | selectattr('mount', 'in', [directorio_descarga, '/var', '/'])
+              | sort(attribute='mount', reverse=true)
+              | first).size_available // 1048576 }}
+
+    - name: Abortar si no hay espacio suficiente
+      ansible.builtin.assert:
+        that: espacio_libre_mb | int >= espacio_minimo_mb
+        fail_msg: >-
+          Espacio insuficiente: {{ espacio_libre_mb }} MB libres,
+          se requieren {{ espacio_minimo_mb }} MB.
+
+  tasks:
+    - name: Limpiar metadatos de dnf para evitar datos obsoletos
+      ansible.builtin.command: dnf clean expire-cache
+      changed_when: false
+
+    - name: Listar paquetes con actualización pendiente
+      ansible.builtin.command: >-
+        dnf check-update {{ '--security' if solo_seguridad | bool else '' }} -q
+      register: check_update
+      changed_when: false
+      # 0 = sin updates, 100 = hay updates, otro = error
+      failed_when: check_update.rc not in [0, 100]
+
+    - name: Descargar parches (sin instalar)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        security: "{{ solo_seguridad | bool }}"
+        download_only: true
+        download_dir: "{{ directorio_descarga }}"
+        update_cache: true
+      register: descarga
+      until: descarga is succeeded
+      retries: "{{ reintentos }}"
+      delay: 15
+      when: check_update.rc == 100
+
+    - name: Contar RPMs descargados
+      ansible.builtin.find:
+        paths: "{{ directorio_descarga }}"
+        patterns: "*.rpm"
+        recurse: true
+      register: rpms
+
+    - name: Resumen por servidor
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Pendientes: {{ 'sí' if check_update.rc == 100 else 'no' }}"
+          - "RPMs en {{ directorio_descarga }}: {{ rpms.matched }}"
