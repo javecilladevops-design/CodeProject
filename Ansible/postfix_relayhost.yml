@@ -1,0 +1,32 @@
+---
+- name: Cambiar relayhost de Postfix
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Comentar el relayhost antiguo (smtp.ngl.corp)
+      ansible.builtin.replace:
+        path: /etc/postfix/main.cf
+        regexp: '^(relayhost\s*=\s*smtp\.ngl\.corp\s*)$'
+        replace: '# \1'
+        backup: true
+      notify: Reiniciar postfix
+
+    - name: Añadir el nuevo relayhost (mailintra.ngl.corp)
+      ansible.builtin.lineinfile:
+        path: /etc/postfix/main.cf
+        regexp: '^relayhost\s*='
+        insertafter: '^#\s*relayhost\s*=\s*smtp\.ngl\.corp'
+        line: 'relayhost = mailintra.ngl.corp'
+        state: present
+      notify: Reiniciar postfix
+
+    - name: Comprobar la sintaxis de la configuración de Postfix
+      ansible.builtin.command: postfix check
+      changed_when: false
+
+  handlers:
+    - name: Reiniciar postfix
+      ansible.builtin.systemd:
+        name: postfix
+        state: restarted
